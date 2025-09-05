@@ -12,6 +12,7 @@
 #include <sys/select.h>
 #include <net/if.h>
 #include <ifaddrs.h>
+#include <ctype.h>
 
 #define MAX_WINDOWS 64
 #define MAX_WORKSPACES 9
@@ -28,6 +29,7 @@ typedef struct {
 typedef struct {
     Window window;
     int is_fullscreen;
+    int is_floating;
     int x, y, width, height;
     int workspace;
     int managed;
@@ -40,18 +42,20 @@ WindowState window_states[MAX_WINDOWS];
 int window_count = 0;
 Window focused = None;
 int dragging = 0;
+int resizing = 0;
 Window drag_window;
 int drag_start_x, drag_start_y;
+int drag_start_width, drag_start_height;
 Window last_focused[MAX_WORKSPACES + 1];
 int current_workspace = 1;
 
 Window bar = 0;
 int bar_height = 24;
 GC bar_gc = 0;
+XFontStruct *bar_font = NULL;
 unsigned long bar_bg = 0x222222;
 unsigned long bar_fg = 0xFFFFFF;
-XFontStruct *bar_font = NULL;
-
+unsigned long background_color = 0x000000;
 unsigned long border_color = 0x444444;
 unsigned long border_focus_color = 0x0000FF;
 char *wallpaper_path = NULL;
@@ -142,6 +146,8 @@ void load_config() {
                 bar_bg = strtoul(value, NULL, 0);
             } else if (strcmp(key, "bar_fg") == 0) {
                 bar_fg = strtoul(value, NULL, 0);
+            } else if (strcmp(key, "background_color") == 0) {
+                background_color = strtoul(value, NULL, 0);
             }
         } else if (strcmp(section, "Keybinds") == 0 && keybind_count < MAX_KEYBINDS) {
             char *mod_part = strtok(key, "+");
@@ -170,6 +176,13 @@ void apply_window_border(Window w, Bool is_focused) {
     XSetWindowBorder(display, w, is_focused ? border_focus_color : border_color);
 }
 
+void set_background() {
+    int screen = DefaultScreen(display);
+    Window root_window = RootWindow(display, screen);
+    XSetWindowBackground(display, root_window, background_color);
+    XClearWindow(display, root_window);
+}
+
 void spawn(const char *cmd) {
     if (!cmd || fork() != 0) return;
     setsid();
@@ -187,6 +200,18 @@ int idx_of_window(Window w) {
         if (window_states[i].managed && window_states[i].window == w)
             return i;
     return -1;
+}
+
+void toggle_floating(Window w) {
+    int i = idx_of_window(w);
+    if (i < 0) return;
+    WindowState *state = &window_states[i];
+    state->is_floating = !state->is_floating;
+    if (!state->is_floating) {
+        tile_windows();
+    } else {
+        XRaiseWindow(display, w);
+    }
 }
 
 void fullscreen_window(Window w) {
@@ -219,7 +244,8 @@ int is_window_on_current_ws(WindowState *s) {
 void tile_windows() {
     int visible_count = 0;
     for (int i = 0; i < window_count; i++)
-        if (window_states[i].managed && is_window_on_current_ws(&window_states[i]) && !window_states[i].is_fullscreen)
+        if (window_states[i].managed && is_window_on_current_ws(&window_states[i]) && 
+            !window_states[i].is_fullscreen && !window_states[i].is_floating)
             visible_count++;
     if (visible_count == 0) {
         draw_bar();
@@ -232,7 +258,8 @@ void tile_windows() {
     int available_h = screen_height - bar_height;
     int i_vis = 0;
     for (int i = 0; i < window_count; i++) {
-        if (!window_states[i].managed || !is_window_on_current_ws(&window_states[i]) || window_states[i].is_fullscreen)
+        if (!window_states[i].managed || !is_window_on_current_ws(&window_states[i]) || 
+            window_states[i].is_fullscreen || window_states[i].is_floating)
             continue;
         Window w = window_states[i].window;
         int target_x, target_y, target_w, target_h;
@@ -269,7 +296,7 @@ void set_wm_desktop(Window w, int ws) {
 void add_window(Window w) {
     if (window_count >= MAX_WINDOWS) return;
     windows[window_count] = w;
-    window_states[window_count] = (WindowState){ w, 0, 0, 0, 0, 0, current_workspace, 1 };
+    window_states[window_count] = (WindowState){ w, 0, 0, 0, 0, 0, 0, current_workspace, 1 };
     window_count++;
     XSelectInput(display, w, EnterWindowMask | FocusChangeMask | PropertyChangeMask);
     apply_window_border(w, False);
@@ -400,13 +427,10 @@ int count_windows_on_ws(int ws) {
 }
 
 void get_battery_status(char *buf, size_t bufsz) {
-    FILE *f = fopen("/dev/acpi_batt/0", "r");
+    FILE *f = fopen("/sys/class/power_supply/BAT0/capacity", "r");
     if (!f) {
-        f = fopen("/sys/class/power_supply/BAT0/capacity", "r");
-        if (!f) {
-            snprintf(buf, bufsz, "BAT: --%%");
-            return;
-        }
+        snprintf(buf, bufsz, "BAT: --%%");
+        return;
     }
     int capacity = -1;
     if (f) {
@@ -414,23 +438,6 @@ void get_battery_status(char *buf, size_t bufsz) {
         fclose(f);
     }
     snprintf(buf, bufsz, "BAT: %d%%", capacity >= 0 ? capacity : 0);
-}
-
-void get_network_status(char *buf, size_t bufsz) {
-    struct ifaddrs *ifaddr, *ifa;
-    int online = 0;
-    if (getifaddrs(&ifaddr) == -1) {
-        snprintf(buf, bufsz, "NET: err");
-        return;
-    }
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-        if (!ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
-            continue;
-        online = 1;
-        break;
-    }
-    freeifaddrs(ifaddr);
-    snprintf(buf, bufsz, "NET: %s", online ? "ON" : "OFF");
 }
 
 void draw_bar() {
@@ -474,6 +481,23 @@ void draw_bar() {
     XDrawString(display, bar, bar_gc, screen_width - right_w - 8, y, right, (int)strlen(right));
 }
 
+void get_network_status(char *buf, size_t bufsz) {
+    struct ifaddrs *ifaddr, *ifa;
+    int online = 0;
+    if (getifaddrs(&ifaddr) == -1) {
+        snprintf(buf, bufsz, "NET: err");
+        return;
+    }
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_name || !(ifa->ifa_flags & IFF_UP) || (ifa->ifa_flags & IFF_LOOPBACK))
+            continue;
+        online = 1;
+        break;
+    }
+    freeifaddrs(ifaddr);
+    snprintf(buf, bufsz, "NET: %s", online ? "ON" : "OFF");
+}
+
 void init_ewmh() {
     net_number_of_desktops = XInternAtom(display, "_NET_NUMBER_OF_DESKTOPS", False);
     net_current_desktop = XInternAtom(display, "_NET_CURRENT_DESKTOP", False);
@@ -509,6 +533,8 @@ void handle_keybind(KeySym keysym, unsigned int state) {
                 close_focused_window();
             } else if (strcmp(cmd, "fullscreen") == 0 && focused != None) {
                 fullscreen_window(focused);
+            } else if (strcmp(cmd, "float") == 0 && focused != None) {
+                toggle_floating(focused);
             } else if (strncmp(cmd, "ws", 2) == 0) {
                 int ws = atoi(cmd + 2);
                 switch_workspace(ws);
@@ -553,6 +579,9 @@ void grab_keys() {
     XGrabButton(display, Button1, Mod4Mask, root, True,
                 ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
                 GrabModeAsync, GrabModeAsync, None, None);
+    XGrabButton(display, Button3, Mod4Mask, root, True,
+                ButtonPressMask | ButtonReleaseMask | PointerMotionMask,
+                GrabModeAsync, GrabModeAsync, None, None);
 }
 
 int xerror(Display *dpy, XErrorEvent *ee) {
@@ -580,6 +609,7 @@ int main(int argc, char *argv[]) {
     XDefineCursor(display, root, cursor);
     create_bar();
     init_ewmh();
+    set_background();
     XSync(display, False);
 
     int xfd = ConnectionNumber(display);
@@ -627,25 +657,51 @@ int main(int argc, char *argv[]) {
                                 drag_window = None;
                                 break;
                             }
-                            dragging = 1;
-                            drag_start_x = ev.xbutton.x_root;
-                            drag_start_y = ev.xbutton.y_root;
+                            int i = idx_of_window(drag_window);
+                            if (i >= 0 && !window_states[i].is_floating) {
+                                toggle_floating(drag_window);
+                            }
+                            XWindowAttributes attr;
+                            if (XGetWindowAttributes(display, drag_window, &attr)) {
+                                if (ev.xbutton.button == Button1) {
+                                    dragging = 1;
+                                    drag_start_x = ev.xbutton.x_root;
+                                    drag_start_y = ev.xbutton.y_root;
+                                } else if (ev.xbutton.button == Button3) {
+                                    resizing = 1;
+                                    drag_start_x = ev.xbutton.x_root;
+                                    drag_start_y = ev.xbutton.y_root;
+                                    drag_start_width = attr.width;
+                                    drag_start_height = attr.height;
+                                }
+                            }
                         }
                         break;
                     case MotionNotify:
-                        if (dragging && drag_window != None) {
-                            int dx = ev.xmotion.x_root - drag_start_x;
-                            int dy = ev.xmotion.y_root - drag_start_y;
+                        if (drag_window != None) {
                             XWindowAttributes attr;
                             if (XGetWindowAttributes(display, drag_window, &attr)) {
-                                XMoveWindow(display, drag_window, attr.x + dx, attr.y + dy);
-                                drag_start_x = ev.xmotion.x_root;
-                                drag_start_y = ev.xmotion.y_root;
+                                if (dragging) {
+                                    int dx = ev.xmotion.x_root - drag_start_x;
+                                    int dy = ev.xmotion.y_root - drag_start_y;
+                                    XMoveWindow(display, drag_window, attr.x + dx, attr.y + dy);
+                                    drag_start_x = ev.xmotion.x_root;
+                                    drag_start_y = ev.xmotion.y_root;
+                                } else if (resizing) {
+                                    int dx = ev.xmotion.x_root - drag_start_x;
+                                    int dy = ev.xmotion.y_root - drag_start_y;
+                                    int new_width = drag_start_width + dx;
+                                    int new_height = drag_start_height + dy;
+                                    if (new_width > 100 && new_height > 100) {
+                                        XResizeWindow(display, drag_window, new_width, new_height);
+                                    }
+                                }
                             }
                         }
                         break;
                     case ButtonRelease:
                         dragging = 0;
+                        resizing = 0;
                         drag_window = None;
                         break;
                     case ClientMessage:
